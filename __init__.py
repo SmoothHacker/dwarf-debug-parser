@@ -4,23 +4,94 @@
 # available for all valid binary views, with the ability to parse and apply debug info to existing BNDBs.
 import binaryninja as bn
 from elftools import dwarf
+from elftools.dwarf import descriptions
 from elftools.elf import elffile
 
 
 def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, func_die: dwarf.die):
-    bn.log_debug(f"Recording function: {func_die.attributes['DW_AT_name'].value} at addr {hex(func_die.attributes['DW_AT_low_pc'].value)}")
+    bn.log_debug(
+        f"Recording function: {func_die.attributes['DW_AT_name'].value} at addr {hex(func_die.attributes['DW_AT_low_pc'].value)}")
     function_info = bn.debuginfo.DebugFunctionInfo(
         full_name=func_die.attributes["DW_AT_name"].value, address=func_die.attributes["DW_AT_low_pc"].value,
     )
     debug_info.add_function(function_info)
 
 
-def record_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, dwarf_info: dwarf.dwarfinfo):
-    return None
+def record_data_variable(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, variable_die: dwarf.die,
+                         CU: dwarf.compileunit.CompileUnit):
+    # Get name of data var
+    name = variable_die.attributes['DW_AT_name'].value.decode("utf-8")
+    bn.log_debug(f"Examining data var - name: {name}")
+
+    # Get type of data var
+    type_die = variable_die.get_DIE_from_attribute("DW_AT_type")
+    data_var_type = None
+    if type_die.tag == "DW_TAG_base_type":
+        data_var_type_dwarf = type_die.attributes['DW_AT_name'].value
+        data_var_type = bv.parse_type_string(data_var_type_dwarf.decode("utf-8"))[0]
+    elif type_die.tag == "DW_TAG_const_type":
+        # Have to come up with better system to parse const composite and primitive types
+        return
+    else:
+        bn.log_error(f"Unknown type_die encountered: {type_die.tag}")
+        return
+
+    # Get location of data var in memory
+    expr_dump_obj = dwarf.descriptions.ExprDumper(CU.structs)
+    location_str = expr_dump_obj.dump_expr(variable_die.attributes['DW_AT_location'].value, CU.cu_offset)
+    address_str = location_str.split(' ', 1)[1]
+    address = int(address_str, 16)
+
+    bn.log_debug(f"Creating data var: {name} @ {address} with type: {data_var_type.get_string()}")
+    debug_info.add_data_variable(address, data_var_type, name)
 
 
-def record_struct(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, dwarf_info: dwarf.dwarfinfo):
-    return None
+def record_struct(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, struct_die: dwarf.die):
+    if 'DW_AT_name' not in struct_die.attributes:
+        # This is a typedef-ed struct. Will be handled in the future
+        return
+
+    new_struct = bn.StructureBuilder.create()
+    bn.log_debug(f"Examining struct: {struct_die.attributes['DW_AT_name'].value}")
+    # Iterate through stuct members
+    for struct_die_member in struct_die.iter_children():
+        if 'DW_AT_name' not in struct_die_member.attributes:
+            bn.log_error(
+                f"Failed to parse struct: {struct_die.attributes['DW_AT_name'].value}. Anonymous union detected")
+            continue
+
+        # fetch die with dwarf type for member
+        member_type_dwarf = struct_die_member.get_DIE_from_attribute("DW_AT_type")
+        bn.log_debug(f"Parsing struct member: {struct_die_member.attributes['DW_AT_name'].value.decode('utf-8')}")
+
+        # Check if DW_TAG_base_type or DW_TAG_typedef
+        if member_type_dwarf.tag == "DW_TAG_typedef":
+            # Must follow typedef. Currently, handle typedefs to primitive types
+            member_type = bv.parse_type_string(member_type_dwarf.attributes['DW_AT_name'].value.decode("utf-8"))[0]
+            new_struct.append(member_type, struct_die_member.attributes['DW_AT_name'].value.decode("utf-8"))
+        elif member_type_dwarf.tag == "DW_TAG_base_type":
+            # Can grab name, encoding, and byte size
+            member_type = bv.parse_type_string(member_type_dwarf.attributes['DW_AT_name'].value.decode("utf-8"))[0]
+            new_struct.append(member_type, struct_die_member.attributes['DW_AT_name'].value.decode("utf-8"))
+        elif member_type_dwarf.tag == "DW_TAG_array_type":
+            array_type = member_type_dwarf.get_DIE_from_attribute("DW_AT_type")
+            array_type = bv.parse_type_string(array_type.attributes['DW_AT_name'].value.decode("utf-8"))[0]
+            array_size = 1  # Placeholder until DW_TAG_subrange_type is found
+
+            # Access DW_TAG_subrange_type DIE for ArraySize
+            for child in member_type_dwarf.iter_children():
+                if child.tag == "DW_TAG_subrange_type":
+                    array_size = child.attributes['DW_AT_count'].value
+
+            bn.log_debug(f"Found struct array - Type: {array_type} Size: {array_size}")
+            member_type = bn.types.Type.array(array_type, array_size)
+            new_struct.append(member_type, struct_die_member.attributes['DW_AT_name'].value.decode("utf-8"))
+            continue
+        else:
+            bn.log_error(f"Failed to parse struct member. Unknown tag: {member_type_dwarf.tag}")
+
+    bn.log_debug(f"Recording struct: {struct_die.attributes['DW_AT_name'].value}")
+    debug_info.add_type(struct_die.attributes['DW_AT_name'].value.decode("utf-8"), bn.Type.structure_type(new_struct))
 
 
 def is_valid(bv: bn.binaryview.BinaryView):
@@ -41,6 +112,12 @@ def parse_info(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView)
         for DIE in CU.get_top_DIE().iter_children():
             if DIE.tag == "DW_TAG_subprogram":
                 record_function(debug_info, bv, DIE)
+            elif DIE.tag == "DW_TAG_structure_type":
+                record_struct(debug_info, bv, DIE)
+            elif DIE.tag == "DW_TAG_variable":
+                record_data_variable(debug_info, bv, DIE, CU)
+            else:
+                bn.log_error(f"Unknown DIE tag: {DIE.tag}")
 
     file_obj.close()
     """
