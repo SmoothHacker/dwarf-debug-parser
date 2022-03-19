@@ -2,10 +2,71 @@
 # All that is required is to provide functions similar to "is_valid" and "parse_info" below, and call
 # `binaryninja.debuginfo.DebugInfoParser.register` with a name for your parser; your parser will be made
 # available for all valid binary views, with the ability to parse and apply debug info to existing BNDBs.
+from typing import Optional
+from collections import deque
+
+from pprint import pp
+
 import binaryninja as bn
+from binaryninja import Type
 from elftools import dwarf
 from elftools.dwarf import descriptions
 from elftools.elf import elffile
+
+# Append DIEs for DW_TAG_pointer_types that need to be visited at the end of the type parsing process
+unknown_type_DIEs = deque([])
+
+
+# If return type is none then the DIE should be added to unknown_type_DIEs
+def check_if_type_exists(type_str: str, bv: bn.binaryview.BinaryView) -> Optional[Type]:
+    try:
+        return bv.parse_type_string(type_str)[0]  # Gets bn.types.Type from tuple
+    except SyntaxError:
+        # Type is unknown to the current binary view
+        return None
+
+
+def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, pointer_level: int) -> Optional[Type]:
+    child_type = data_type_die.get_DIE_from_attribute("DW_AT_type")
+    if child_type.tag == "DW_TAG_pointer_type":
+        return get_pointer_type(child_type, bv, pointer_level + 1)
+
+    elif child_type.tag == "DW_TAG_typedef":
+        new_type_str = get_attribute_str_value(data_type_die, "DW_AT_name")
+        new_type_str += "*" * pointer_level
+        return check_if_type_exists(new_type_str, bv)
+
+    elif child_type.tag == "DW_TAG_base_type":
+        new_type_str = get_attribute_str_value(data_type_die, "DW_AT_name")
+        new_type_str += "*" * pointer_level
+        return bv.parse_type_string(new_type_str)[0]
+
+    else:
+        bn.log_error(f"Unknown child_type TAG in get_pointer_type: {child_type.tag}")
+        return None
+
+
+# If all the types of the struct are recognized by the binary_view then return true.
+# If not then return false
+def check_struct_types(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView) -> bool:
+    for child in data_type_die.iter_children():
+        member_type_die = child.get_DIE_from_attribute("DW_AT_type")
+        if member_type_die.tag == "DW_base_type":
+            # bv is guaranteed to recognize a base type
+            continue
+        elif member_type_die.tag == "DW_TAG_pointer_type":
+            # Calls recursive func to follow pointers
+            bv_type = get_pointer_type(data_type_die, bv, 1)
+            if bv_type is None:
+                unknown_type_DIEs.append(member_type_die)  # add member_type for later processing
+                unknown_type_DIEs.append(data_type_die)  # add parent too for later processing
+                return False
+        elif member_type_die.tag == "DW_TAG_array_type":
+            # Found array member
+            continue
+        else:
+            bn.log_error(f"[check_struct_types] Unknown member_type_die TAG: {member_type_die.tag}")
+    return True
 
 
 def get_attribute_str_value(die: dwarf.die, attribute_key: str):
@@ -13,16 +74,51 @@ def get_attribute_str_value(die: dwarf.die, attribute_key: str):
 
 
 def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, func_die: dwarf.die):
-    bn.log_debug(
-        f"Recording function: {get_attribute_str_value(func_die, 'DW_AT_name')} at addr {hex(func_die.attributes['DW_AT_low_pc'].value)}")
+    if get_attribute_str_value(func_die, "DW_AT_name") == "local_parameters":
+        function_info = bn.debuginfo.DebugFunctionInfo(
+            full_name="local_parameters", address=0x4011b0,
+            return_type=bn.types.Type.void(), parameters=[("value_1", bn.types.Type.bool()), ("value_2",),
+                                                          ("value_3",
+                                                           bn.types.Type.pointer(bv.arch, bn.types.Type.char())),
+                                                          ("value_4", bn.types.Type.int(1, False)),
+                                                          ("value_5", bn.types.Type.char())]
+        )
+        debug_info.add_function(function_info)
+
+    return
+    # Grab return type
+    ret_type = None
+    if "DW_AT_type" not in func_die.attributes:
+        ret_type = bn.types.Type.void()
+    else:
+        type_die = func_die.get_DIE_from_attribute("DW_AT_type")
+        ret_type = bv.parse_type_string(get_attribute_str_value(type_die, "DW_AT_name"))[0]
+
+    # Grab parameter names and types
+    param_list = []
+    for param_die in func_die.iter_children():
+        # Get name
+        param_name = get_attribute_str_value(param_die, "DW_AT_name")
+        # Get type
+        param_type_die = param_die.get_DIE_from_attribute("DW_AT_type")
+        param_type = None
+        if param_type_die.tag == "DW_AT_pointer_type":
+            param_type = bn.types.Type.pointer(bv.arch, bn.types.Type.int(4, False))
+        else:
+            param_type = bv.parse_type_string(get_attribute_str_value(param_type_die, "DW_AT_name"))[0]
+
+        param_list.append((param_name, param_type))
+
+    pp(param_list)
     function_info = bn.debuginfo.DebugFunctionInfo(
         full_name=get_attribute_str_value(func_die, 'DW_AT_name'), address=func_die.attributes["DW_AT_low_pc"].value,
+        return_type=ret_type, parameters=param_list
     )
     debug_info.add_function(function_info)
 
 
 def record_data_variable(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, variable_die: dwarf.die,
-                         CU: dwarf.compileunit.CompileUnit):
+                         cu: dwarf.compileunit.CompileUnit):
     # Get name of data var
     name = get_attribute_str_value(variable_die, "DW_AT_name")
     bn.log_debug(f"Examining data var - name: {name}")
@@ -36,66 +132,52 @@ def record_data_variable(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.B
     elif type_die.tag == "DW_TAG_const_type":
         # Have to come up with better system to parse const composite and primitive types
         return
+    elif type_die.tag == "DW_TAG_structure_type":
+        return
     else:
-        bn.log_error(f"Unknown type_die encountered: {type_die.tag}")
+        bn.log_error(f"[data_var] Unknown type_die encountered: {type_die.tag}")
         return
 
     # Get location of data var in memory
-    expr_dump_obj = dwarf.descriptions.ExprDumper(CU.structs)
-    location_str = expr_dump_obj.dump_expr(variable_die.attributes['DW_AT_location'].value, CU.cu_offset)
+    expr_dump_obj = dwarf.descriptions.ExprDumper(cu.structs)
+    location_str = expr_dump_obj.dump_expr(variable_die.attributes['DW_AT_location'].value, cu.cu_offset)
     address_str = location_str.split(' ', 1)[1]
     address = int(address_str, 16)
 
-    bn.log_debug(f"Creating data var: {name} @ {address} with type: {data_var_type.get_string()}")
+    bn.log_debug(f"Creating data var: {name} @ {hex(address)} with type: {data_var_type.get_string()}")
     debug_info.add_data_variable(address, data_var_type, name)
 
 
-def record_struct(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, struct_die: dwarf.die):
-    if 'DW_AT_name' not in struct_die.attributes:
-        # This is a typedef-ed struct. Will be handled in the future
+# Examine data_type_die to see if known to the current binary_view.
+# If the type is known then skip the die and return early.
+# If the type is not known but its subtypes are known then record the type.
+# If the type is not known and any subtype is not also known then queue the data_type_die for later analysis
+def record_data_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, data_type_die: dwarf.die):
+    if data_type_die.tag == "DW_TAG_structure_type" and ('DW_AT_name' not in data_type_die.attributes):
+        # This is a typedef-ed structure. A DW_TAG_typedef DIE will record this struct later
         return
-
-    new_struct = bn.StructureBuilder.create()
-    bn.log_debug(f"Examining struct: {get_attribute_str_value(struct_die, 'DW_AT_name')}")
-    # Iterate through stuct members
-    for struct_die_member in struct_die.iter_children():
-        if 'DW_AT_name' not in struct_die_member.attributes:
-            bn.log_error(
-                f"Failed to parse struct: {get_attribute_str_value(struct_die, 'DW_AT_name')}. Anonymous union detected")
-            continue
-
-        # fetch die with dwarf type for member
-        member_type_dwarf = struct_die_member.get_DIE_from_attribute("DW_AT_type")
-        bn.log_debug(f"Parsing struct member: {get_attribute_str_value(struct_die_member, 'DW_AT_name')}")
-
-        # Check if DW_TAG_base_type or DW_TAG_typedef
-        if member_type_dwarf.tag == "DW_TAG_typedef":
-            # Must follow typedef. Currently, handle typedefs to primitive types
-            member_type = bv.parse_type_string(get_attribute_str_value(member_type_dwarf, 'DW_AT_name'))[0]
-            new_struct.append(member_type, get_attribute_str_value(struct_die_member, 'DW_AT_name'))
-        elif member_type_dwarf.tag == "DW_TAG_base_type":
-            # Can grab name, encoding, and byte size
-            member_type = bv.parse_type_string(get_attribute_str_value(member_type_dwarf, 'DW_AT_name'))[0]
-            new_struct.append(member_type, get_attribute_str_value(struct_die_member, 'DW_AT_name'))
-        elif member_type_dwarf.tag == "DW_TAG_array_type":
-            array_type = member_type_dwarf.get_DIE_from_attribute("DW_AT_type")
-            array_type = bv.parse_type_string(get_attribute_str_value(array_type, 'DW_AT_name'))[0]
-            array_size = 1  # Placeholder until DW_TAG_subrange_type is found
-
-            # Access DW_TAG_subrange_type DIE for ArraySize
-            for child in member_type_dwarf.iter_children():
-                if child.tag == "DW_TAG_subrange_type":
-                    array_size = child.attributes['DW_AT_count'].value
-
-            bn.log_debug(f"Found struct array - Type: {array_type} Size: {array_size}")
-            member_type = bn.types.Type.array(array_type, array_size)
-            new_struct.append(member_type, get_attribute_str_value(struct_die_member, 'DW_AT_name'))
-            continue
+    if data_type_die.tag == "DW_TAG_pointer_type":
+        # pointer_type DIEs don't have a name attribute
+        addr_to_type = data_type_die.attributes['DW_AT_type']
+    elif data_type_die.tag == "DW_TAG_array_type":
+        return
+    else:
+        data_type_str = get_attribute_str_value(data_type_die, 'DW_AT_name')
+        is_type_known = check_if_type_exists(data_type_str, bv)
+        if is_type_known is bn.Type:
+            # data_type is known do nothing
+            return
+        # Data type is not known check if all subtypes are known. If not then queue DIE for later analysis
+        # Check if die is a DW_TAG_structure_type
+        if data_type_die.tag == "DW_TAG_structure_type":
+            check_struct_types(data_type_die, bv)  # change func to attempt to create struct return None if failed
+            # due to unknown type
+            debug_info.add_type("", None)
+        elif data_type_die.tag == "DW_TAG_typedef":
+            debug_info.add_type("", None)
         else:
-            bn.log_error(f"Failed to parse struct member. Unknown tag: {member_type_dwarf.tag}")
-
-    bn.log_debug(f"Recording struct: {get_attribute_str_value(struct_die, 'DW_AT_name')}")
-    debug_info.add_type(get_attribute_str_value(struct_die, 'DW_AT_name'), bn.Type.structure_type(new_struct))
+            bn.log_error(f"Encountered unknown TAG in record_data_type() - {data_type_die.tag}")
+    return None
 
 
 def is_valid(bv: bn.binaryview.BinaryView):
@@ -112,16 +194,37 @@ def parse_info(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView)
     elf_file = elffile.ELFFile(file_obj)
     dwarf_info = elf_file.get_dwarf_info()
 
+    # iter CUs for types
+    for CU in dwarf_info.iter_CUs():
+        for DIE in CU.get_top_DIE().iter_children():
+            """
+            DW_TAG_base_type: a data type that isn't defined in terms of other types
+            DW_TAG_typedef: data type that can reference base or composite types. Referred type can be unknown 
+                            on first visit.
+            """
+            if DIE.tag == "DW_TAG_pointer_type" or \
+                    DIE.tag == "DW_TAG_array_type" or \
+                    DIE.tag == "DW_TAG_typedef" or \
+                    DIE.tag == "DW_TAG_structure_type":
+                record_data_type(debug_info, bv, DIE)
+
+    while len(unknown_type_DIEs) > 0:
+        # Process unknown DIEs until the queue is empty
+        unknown_type_die = unknown_type_DIEs.popleft()
+        if record_data_type(debug_info, bv, unknown_type_die) is False:
+            unknown_type_DIEs.append(unknown_type_die)
+
+    # iter CUs for functions
     for CU in dwarf_info.iter_CUs():
         for DIE in CU.get_top_DIE().iter_children():
             if DIE.tag == "DW_TAG_subprogram":
                 record_function(debug_info, bv, DIE)
-            elif DIE.tag == "DW_TAG_structure_type":
-                record_struct(debug_info, bv, DIE)
-            elif DIE.tag == "DW_TAG_variable":
+
+    # iter CUs for data_variables
+    for CU in dwarf_info.iter_CUs():
+        for DIE in CU.get_top_DIE().iter_children():
+            if DIE.tag == "DW_TAG_variable":
                 record_data_variable(debug_info, bv, DIE, CU)
-            else:
-                bn.log_error(f"Unknown DIE tag: {DIE.tag}")
 
     file_obj.close()
     """
