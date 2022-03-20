@@ -26,7 +26,7 @@ def check_if_type_exists(type_str: str, bv: bn.binaryview.BinaryView) -> Optiona
         return None
 
 
-def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, pointer_level: int) -> Optional[Type]:
+def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, pointer_level: int = 1) -> Optional[tuple]:
     child_type = data_type_die.get_DIE_from_attribute("DW_AT_type")
     if child_type.tag == "DW_TAG_pointer_type":
         return get_pointer_type(child_type, bv, pointer_level + 1)
@@ -34,12 +34,17 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
     elif child_type.tag == "DW_TAG_typedef":
         new_type_str = get_attribute_str_value(data_type_die, "DW_AT_name")
         new_type_str += "*" * pointer_level
-        return check_if_type_exists(new_type_str, bv)
+        bv_type = check_if_type_exists(new_type_str, bv)
+        if bv_type is None:
+            unknown_type_DIEs.append(child_type)
+            return None
+        else:
+            return new_type_str, bv_type
 
     elif child_type.tag == "DW_TAG_base_type":
-        new_type_str = get_attribute_str_value(data_type_die, "DW_AT_name")
+        new_type_str = get_attribute_str_value(child_type, "DW_AT_name")
         new_type_str += "*" * pointer_level
-        return bv.parse_type_string(new_type_str)[0]
+        return new_type_str, check_if_type_exists(new_type_str, bv)
 
     else:
         bn.log_error(f"Unknown child_type TAG in get_pointer_type: {child_type.tag}")
@@ -145,13 +150,18 @@ def record_data_variable(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.B
 # If the type is known then skip the die and return early.
 # If the type is not known but its subtypes are known then record the type.
 # If the type is not known and any subtype is not also known then queue the data_type_die for later analysis
-def record_data_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, data_type_die: dwarf.die):
+def record_data_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView,
+                     data_type_die: dwarf.die) -> None:
     if data_type_die.tag == "DW_TAG_structure_type" and ('DW_AT_name' not in data_type_die.attributes):
         # This is a typedef-ed structure. A DW_TAG_typedef DIE will record this struct later
         return
     if data_type_die.tag == "DW_TAG_pointer_type":
         # pointer_type DIEs don't have a name attribute
-        addr_to_type = data_type_die.attributes['DW_AT_type']
+        pointer_type = get_pointer_type(data_type_die, bv)
+        if pointer_type is None:
+            return
+        debug_info.add_type(pointer_type[0], pointer_type[1])
+
     elif data_type_die.tag == "DW_TAG_array_type":
         return
     else:
@@ -163,14 +173,19 @@ def record_data_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binar
         # Data type is not known check if all subtypes are known. If not then queue DIE for later analysis
         # Check if die is a DW_TAG_structure_type
         if data_type_die.tag == "DW_TAG_structure_type":
-            check_struct_types(data_type_die, bv)  # change func to attempt to create struct return None if failed
+            if check_struct_types(data_type_die, bv):
+                return
+            else:
+                unknown_type_DIEs.append(data_type_die)
+                return
+            # change func to attempt to create struct return None if failed
             # due to unknown type
             # debug_info.add_type("", None)
         elif data_type_die.tag == "DW_TAG_typedef":
             debug_info.add_type("", None)
         else:
             bn.log_error(f"Encountered unknown TAG in record_data_type() - {data_type_die.tag}")
-    return None
+    return
 
 
 def is_valid(bv: bn.binaryview.BinaryView):
@@ -195,8 +210,7 @@ def parse_info(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView)
             DW_TAG_typedef: data type that can reference base or composite types. Referred type can be unknown 
                             on first visit.
             """
-            if DIE.tag == "DW_TAG_pointer_type" or \
-                    DIE.tag == "DW_TAG_array_type" or \
+            if DIE.tag == "DW_TAG_array_type" or \
                     DIE.tag == "DW_TAG_typedef" or \
                     DIE.tag == "DW_TAG_structure_type":
                 record_data_type(debug_info, bv, DIE)
