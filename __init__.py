@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from typing import Optional
 
 import binaryninja as bn
@@ -9,10 +8,11 @@ from elftools.elf import elffile
 from .utils import get_attribute_str_value
 
 
-def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, pointer_level: int = 1) -> Optional[tuple]:
+def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, pointer_level: int = 1) -> \
+        Optional[tuple[str, bn.types.Type]]:
     # Check for void pointer
     if "DW_AT_type" not in data_type_die.attributes:
-        return bv.parse_type_string("void" + "*" * pointer_level)
+        return ("void" + ("*" * pointer_level)), bv.parse_type_string("void" + ("*" * pointer_level))[0]
 
     child_type_die = data_type_die.get_DIE_from_attribute("DW_AT_type")
     if child_type_die.tag == "DW_TAG_pointer_type":
@@ -23,15 +23,14 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
         new_type_str += "*" * pointer_level
         bv_type = recover_data_type(bv, child_type_die)
         if bv_type is None:
-
             return None
         else:
-            return new_type_str, bv_type
+            return new_type_str, bv_type[1]
 
     elif child_type_die.tag == "DW_TAG_base_type":
         new_type_str = get_attribute_str_value(child_type_die, "DW_AT_name")
         new_type_str += "*" * pointer_level
-        return new_type_str, recover_data_type(bv, child_type_die)
+        return new_type_str, recover_data_type(bv, child_type_die)[1]
 
     else:
         bn.log_error(f"Unknown child_type TAG in get_pointer_type: {child_type_die.tag}")
@@ -40,38 +39,75 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
 
 # Recover Data Type and return a tuple to the calling function for further construction or recording
 def recover_data_type(bv: bn.binaryview.BinaryView, data_type_die: dwarf.die) -> Optional[tuple[str, bn.types.Type]]:
-    if data_type_die.tag == "DW_TAG_structure_type" and ('DW_AT_name' not in data_type_die.attributes):
-        # This is a typedef-ed structure. A DW_TAG_typedef DIE will record this struct later
-        return
     if data_type_die.tag == "DW_TAG_pointer_type":
         # pointer_type DIEs don't have a name attribute
         pointer_type = get_pointer_type(data_type_die, bv)
         if pointer_type is None:
-            return
+            return None
+        else:
+            return pointer_type
 
     elif data_type_die.tag == "DW_TAG_array_type":
-        return
+        array_core_type_die = data_type_die.get_DIE_from_attribute("DW_AT_type")
+        array_core_type = recover_data_type(bv, array_core_type_die)
+        # Get array size
+        array_size = 1
+        for sub_range_die in data_type_die.iter_children():
+            # Verify if we're in a subrange_type DIE
+            if sub_range_die.tag is not "DW_TAG_subrange_tpe":
+                bn.log_error(f"Unknown array subrange_type, TAG: {sub_range_die.tag}")
+                return None
+            # Check for DW_AT_upper_bound or DW_AT_count
+            if "DW_AT_count" is sub_range_die.attributes:
+                array_size = sub_range_die.attributes["DW_AT_count"]
+            elif "DW_AT_upper_bound" in sub_range_die.attributes:
+                array_size = sub_range_die.attributes["DW_AT_upper_bound"]
+            else:
+                bn.log_error(f"DW_AT_count or DW_AT_upper_bound not found in DIE @ {sub_range_die.offset}")
+                return None
+        array_type = bn.types.Type.array(array_core_type[1], array_size)
+        return array_type.get_string(), array_type
+
     elif data_type_die.tag == "DW_TAG_structure_type":
-        return
-        # change func to attempt to create struct return None if failed
-        # due to unknown type
+        # Build structure iteratively
+        new_struct = bn.types.StructureBuilder.create()
+        new_struct_name = ""
+        if "DW_AT_name" in data_type_die.attributes:
+            new_struct_name = get_attribute_str_value(data_type_die, "DW_AT_name")
+
+        for member_die in data_type_die.iter_children():
+            struct_mem_name = get_attribute_str_value(member_die, "DW_AT_name")
+            struct_mem_type = recover_data_type(bv, member_die)
+            new_struct.append(struct_mem_type[1], struct_mem_name)
+
+        return new_struct_name, bn.types.Type.structure_type(new_struct)
     elif data_type_die.tag == "DW_TAG_typedef":
-        return
+        referred_data_type_die = data_type_die.get_DIE_from_attribute("DW_AT_type")
+        referred_data_type = recover_data_type(bv, referred_data_type_die)
+        referred_data_type_name = get_attribute_str_value(data_type_die, "DW_AT_name")
+
+        return referred_data_type[0], bn.types.Type.named_type_from_type(bn.QualifiedName(referred_data_type_name),
+                                                                         referred_data_type[1])
+    elif data_type_die.tag == "DW_TAG_base_type":
+        # Core language data type. BN is almost certain to be able to recognize it
+        base_type_name = get_attribute_str_value(data_type_die, "DW_AT_name")
+        return base_type_name, bv.parse_type_string(base_type_name)[0]
     else:
-        bn.log_error(f"Encountered unknown TAG in record_data_type() - {data_type_die.tag}")
+        bn.log_error(f"Attempted to recover unknown data_type in DIE: {data_type_die.tag}")
     return None
 
 
 def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, func_die: dwarf.die) -> bool:
     # Grab return type
-    ret_type = None
-    if "DW_AT_type" not in func_die.attributes:
-        ret_type = bn.types.Type.void()
-    else:
+    ret_type = bn.types.Type.void()
+    ret_type_name = ret_type.get_string()
+    if "DW_AT_type" in func_die.attributes:
         type_die = func_die.get_DIE_from_attribute("DW_AT_type")
-        ret_type = bv.parse_type_string(get_attribute_str_value(type_die, "DW_AT_name"))[0]
+        ret_type_name, ret_type = recover_data_type(bv, type_die)
 
+    debug_info.add_type(ret_type_name, ret_type)
     function_info = bn.debuginfo.DebugFunctionInfo(
+        # Function parameter recovery is not available as it is broken in the BN core.
         full_name=get_attribute_str_value(func_die, 'DW_AT_name'), address=func_die.attributes["DW_AT_low_pc"].value,
         return_type=ret_type
     )
