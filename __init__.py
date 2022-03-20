@@ -19,7 +19,7 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
         return get_pointer_type(child_type_die, bv, pointer_level + 1)
 
     elif child_type_die.tag == "DW_TAG_typedef":
-        new_type_str = get_attribute_str_value(data_type_die, "DW_AT_name")
+        new_type_str = get_attribute_str_value(child_type_die, "DW_AT_name")
         new_type_str += "*" * pointer_level
         bv_type = recover_data_type(bv, child_type_die)
         if bv_type is None:
@@ -49,21 +49,23 @@ def recover_data_type(bv: bn.binaryview.BinaryView, data_type_die: dwarf.die) ->
 
     elif data_type_die.tag == "DW_TAG_array_type":
         array_core_type_die = data_type_die.get_DIE_from_attribute("DW_AT_type")
-        array_core_type = recover_data_type(bv, array_core_type_die)
+        array_core_type: tuple[str, bn.Type] = recover_data_type(bv, array_core_type_die)
+        if array_core_type is None:
+            bn.log_error(f"Failed to get array_core_type for DIE @ offset: {hex(data_type_die.offset)}")
         # Get array size
         array_size = 1
         for sub_range_die in data_type_die.iter_children():
             # Verify if we're in a subrange_type DIE
-            if sub_range_die.tag is not "DW_TAG_subrange_tpe":
+            if sub_range_die.tag != "DW_TAG_subrange_type":
                 bn.log_error(f"Unknown array subrange_type, TAG: {sub_range_die.tag}")
                 return None
             # Check for DW_AT_upper_bound or DW_AT_count
-            if "DW_AT_count" is sub_range_die.attributes:
-                array_size = sub_range_die.attributes["DW_AT_count"]
+            if "DW_AT_count" in sub_range_die.attributes:
+                array_size = sub_range_die.attributes["DW_AT_count"].value
             elif "DW_AT_upper_bound" in sub_range_die.attributes:
-                array_size = sub_range_die.attributes["DW_AT_upper_bound"]
+                array_size = sub_range_die.attributes["DW_AT_upper_bound"].value
             else:
-                bn.log_error(f"DW_AT_count or DW_AT_upper_bound not found in DIE @ {sub_range_die.offset}")
+                bn.log_error(f"DW_AT_count or DW_AT_upper_bound not found in DIE @ {hex(sub_range_die.offset)}")
                 return None
         array_type = bn.types.Type.array(array_core_type[1], array_size)
         return array_type.get_string(), array_type
@@ -77,7 +79,8 @@ def recover_data_type(bv: bn.binaryview.BinaryView, data_type_die: dwarf.die) ->
 
         for member_die in data_type_die.iter_children():
             struct_mem_name = get_attribute_str_value(member_die, "DW_AT_name")
-            struct_mem_type = recover_data_type(bv, member_die)
+            struct_mem_type_die = member_die.get_DIE_from_attribute("DW_AT_type")
+            struct_mem_type = recover_data_type(bv, struct_mem_type_die)
             new_struct.append(struct_mem_type[1], struct_mem_name)
 
         return new_struct_name, bn.types.Type.structure_type(new_struct)
@@ -92,6 +95,11 @@ def recover_data_type(bv: bn.binaryview.BinaryView, data_type_die: dwarf.die) ->
         # Core language data type. BN is almost certain to be able to recognize it
         base_type_name = get_attribute_str_value(data_type_die, "DW_AT_name")
         return base_type_name, bv.parse_type_string(base_type_name)[0]
+    elif data_type_die.tag == "DW_TAG_const_type":
+        referred_data_type_die = data_type_die.get_DIE_from_attribute("DW_AT_type")
+        data_type_name, data_type = recover_data_type(bv, referred_data_type_die)
+        return data_type_name, data_type
+
     else:
         bn.log_error(f"Attempted to recover unknown data_type in DIE: {data_type_die.tag}")
     return None
