@@ -2,28 +2,18 @@
 # All that is required is to provide functions similar to "is_valid" and "parse_info" below, and call
 # `binaryninja.debuginfo.DebugInfoParser.register` with a name for your parser; your parser will be made
 # available for all valid binary views, with the ability to parse and apply debug info to existing BNDBs.
-from typing import Optional
 from collections import deque
-
-from pprint import pp
+from typing import Optional
 
 import binaryninja as bn
-from binaryninja import Type
 from elftools import dwarf
 from elftools.dwarf import descriptions
 from elftools.elf import elffile
 
+from utils import get_attribute_str_value, check_if_type_str_exists
+
 # Append DIEs for DW_TAG_pointer_types that need to be visited at the end of the type parsing process
 unknown_type_DIEs = deque([])
-
-
-# If return type is none then the DIE should be added to unknown_type_DIEs
-def check_if_type_exists(type_str: str, bv: bn.binaryview.BinaryView) -> Optional[Type]:
-    try:
-        return bv.parse_type_string(type_str)[0]  # Gets bn.types.Type from tuple
-    except SyntaxError:
-        # Type is unknown to the current binary view
-        return None
 
 
 def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, pointer_level: int = 1) -> Optional[tuple]:
@@ -34,7 +24,7 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
     elif child_type.tag == "DW_TAG_typedef":
         new_type_str = get_attribute_str_value(data_type_die, "DW_AT_name")
         new_type_str += "*" * pointer_level
-        bv_type = check_if_type_exists(new_type_str, bv)
+        bv_type = check_if_type_str_exists(new_type_str, bv)
         if bv_type is None:
             unknown_type_DIEs.append(child_type)
             return None
@@ -44,7 +34,7 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
     elif child_type.tag == "DW_TAG_base_type":
         new_type_str = get_attribute_str_value(child_type, "DW_AT_name")
         new_type_str += "*" * pointer_level
-        return new_type_str, check_if_type_exists(new_type_str, bv)
+        return new_type_str, check_if_type_str_exists(new_type_str, bv)
 
     else:
         bn.log_error(f"Unknown child_type TAG in get_pointer_type: {child_type.tag}")
@@ -53,7 +43,7 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
 
 # If all the types of the struct are recognized by the binary_view then return true.
 # If not then return false
-def check_struct_types(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView) -> bool:
+def build_struct(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView) -> bool:
     for child in data_type_die.iter_children():
         member_type_die = child.get_DIE_from_attribute("DW_AT_type")
         if member_type_die.tag == "DW_TAG_base_type":
@@ -70,16 +60,12 @@ def check_struct_types(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView) -
             # Found array member
             continue
         elif member_type_die.tag == "DW_TAG_typedef":
-            if check_if_type_exists(get_attribute_str_value(member_type_die, "DW_AT_name"), bv) is None:
+            if check_if_type_str_exists(get_attribute_str_value(member_type_die, "DW_AT_name"), bv) is None:
                 unknown_type_DIEs.append(member_type_die)
                 return False
         else:
             bn.log_error(f"[check_struct_types] Unknown member_type_die TAG: {member_type_die.tag}")
     return True
-
-
-def get_attribute_str_value(die: dwarf.die, attribute_key: str):
-    return die.attributes[attribute_key].value.decode("utf-8")
 
 
 def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, func_die: dwarf.die):
@@ -166,14 +152,14 @@ def record_data_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binar
         return
     else:
         data_type_str = get_attribute_str_value(data_type_die, 'DW_AT_name')
-        is_type_known = check_if_type_exists(data_type_str, bv)
+        is_type_known = check_if_type_str_exists(data_type_str, bv)
         if is_type_known is bn.Type:
             # data_type is known do nothing
             return
         # Data type is not known check if all subtypes are known. If not then queue DIE for later analysis
         # Check if die is a DW_TAG_structure_type
         if data_type_die.tag == "DW_TAG_structure_type":
-            if check_struct_types(data_type_die, bv):
+            if build_struct(data_type_die, bv):
                 return
             else:
                 unknown_type_DIEs.append(data_type_die)
