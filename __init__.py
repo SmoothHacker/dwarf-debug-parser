@@ -51,7 +51,7 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
 def check_struct_types(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView) -> bool:
     for child in data_type_die.iter_children():
         member_type_die = child.get_DIE_from_attribute("DW_AT_type")
-        if member_type_die.tag == "DW_base_type":
+        if member_type_die.tag == "DW_TAG_base_type":
             # bv is guaranteed to recognize a base type
             continue
         elif member_type_die.tag == "DW_TAG_pointer_type":
@@ -64,6 +64,10 @@ def check_struct_types(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView) -
         elif member_type_die.tag == "DW_TAG_array_type":
             # Found array member
             continue
+        elif member_type_die.tag == "DW_TAG_typedef":
+            if check_if_type_exists(get_attribute_str_value(member_type_die, "DW_AT_name"), bv) is None:
+                unknown_type_DIEs.append(member_type_die)
+                return False
         else:
             bn.log_error(f"[check_struct_types] Unknown member_type_die TAG: {member_type_die.tag}")
     return True
@@ -74,18 +78,6 @@ def get_attribute_str_value(die: dwarf.die, attribute_key: str):
 
 
 def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.BinaryView, func_die: dwarf.die):
-    if get_attribute_str_value(func_die, "DW_AT_name") == "local_parameters":
-        function_info = bn.debuginfo.DebugFunctionInfo(
-            full_name="local_parameters", address=0x4011b0,
-            return_type=bn.types.Type.void(), parameters=[("value_1", bn.types.Type.bool()), ("value_2",),
-                                                          ("value_3",
-                                                           bn.types.Type.pointer(bv.arch, bn.types.Type.char())),
-                                                          ("value_4", bn.types.Type.int(1, False)),
-                                                          ("value_5", bn.types.Type.char())]
-        )
-        debug_info.add_function(function_info)
-
-    return
     # Grab return type
     ret_type = None
     if "DW_AT_type" not in func_die.attributes:
@@ -95,6 +87,8 @@ def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binary
         ret_type = bv.parse_type_string(get_attribute_str_value(type_die, "DW_AT_name"))[0]
 
     # Grab parameter names and types
+    """
+    Broken until issue #3028 is fixed
     param_list = []
     for param_die in func_die.iter_children():
         # Get name
@@ -108,11 +102,10 @@ def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binary
             param_type = bv.parse_type_string(get_attribute_str_value(param_type_die, "DW_AT_name"))[0]
 
         param_list.append((param_name, param_type))
-
-    pp(param_list)
+    """
     function_info = bn.debuginfo.DebugFunctionInfo(
         full_name=get_attribute_str_value(func_die, 'DW_AT_name'), address=func_die.attributes["DW_AT_low_pc"].value,
-        return_type=ret_type, parameters=param_list
+        return_type=ret_type
     )
     debug_info.add_function(function_info)
 
@@ -172,7 +165,7 @@ def record_data_type(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binar
         if data_type_die.tag == "DW_TAG_structure_type":
             check_struct_types(data_type_die, bv)  # change func to attempt to create struct return None if failed
             # due to unknown type
-            debug_info.add_type("", None)
+            # debug_info.add_type("", None)
         elif data_type_die.tag == "DW_TAG_typedef":
             debug_info.add_type("", None)
         else:
