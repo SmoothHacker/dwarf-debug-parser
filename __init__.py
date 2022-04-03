@@ -114,10 +114,27 @@ def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binary
         ret_type_name, ret_type = recover_data_type(bv, type_die)
 
     debug_info.add_type(ret_type_name, ret_type)
+
+    func_parameters = []
+    for child_die in func_die.iter_children():
+        # Sanity check if the child is a DW_TAG_formal_parameter
+        if child_die.tag != "DW_TAG_formal_parameter":
+            continue
+        param_name = get_attribute_str_value(child_die, "DW_AT_name")
+        param_data_type = bn.types.Type.pointer(bv.arch, bn.types.Type.void())
+        # Sanity check if the child has a DW_AT_type attribute
+        if "DW_AT_type" in child_die.attributes:
+            param_data_type_die = child_die.get_DIE_from_attribute("DW_AT_type")
+            param_type_name, param_data_type = recover_data_type(bv, param_data_type_die)
+            debug_info.add_type(param_type_name, param_data_type)
+
+        func_parameters.append((param_name, param_data_type))
+
+    # Recover function parameter names and types
     function_info = bn.debuginfo.DebugFunctionInfo(
         # Function parameter recovery is not available as it is broken in the BN core.
         full_name=get_attribute_str_value(func_die, 'DW_AT_name'), address=func_die.attributes["DW_AT_low_pc"].value,
-        return_type=ret_type
+        return_type=ret_type, parameters=func_parameters
     )
     return debug_info.add_function(function_info)
 
@@ -144,7 +161,7 @@ def recover_data_variable(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.
 
 
 def is_valid(bv: bn.binaryview.BinaryView) -> bool:
-    if bv.view_type != "ELF":
+    if bv.view_type != "ELF" or ".bndb" in bv.file.filename:
         return False
 
     file_obj = open(bv.file.filename, 'rb')
