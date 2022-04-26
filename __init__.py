@@ -1,3 +1,4 @@
+import pprint
 from typing import Optional
 
 import binaryninja as bn
@@ -31,7 +32,12 @@ def get_pointer_type(data_type_die: dwarf.die, bv: bn.binaryview.BinaryView, poi
         new_type_str = get_attribute_str_value(child_type_die, "DW_AT_name")
         new_type_str += "*" * pointer_level
         return new_type_str, recover_data_type(bv, child_type_die)[1]
-
+    elif child_type_die.tag == "DW_TAG_structure_type":
+        new_type_str = get_attribute_str_value(child_type_die, "DW_AT_name")
+        new_structure = recover_data_type(bv, child_type_die)[1]
+        bn_pointer_to_struct = bn.types.Type.pointer(bv.arch, new_structure)
+        new_type_str += "*" * pointer_level
+        return new_type_str, bn_pointer_to_struct
     else:
         bn.log_error(f"Unknown child_type TAG in get_pointer_type: {child_type_die.tag}")
         return None
@@ -124,6 +130,8 @@ def record_function(debug_info: bn.debuginfo.DebugInfo, bv: bn.binaryview.Binary
         param_data_type = bn.types.Type.pointer(bv.arch, bn.types.Type.void())
         # Sanity check if the child has a DW_AT_type attribute
         if "DW_AT_type" in child_die.attributes:
+            bn.log_debug(f"Looking at DW_AT_type for name: {param_name}")
+            pprint.pp(child_die)
             param_data_type_die = child_die.get_DIE_from_attribute("DW_AT_type")
             param_type_name, param_data_type = recover_data_type(bv, param_data_type_die)
             debug_info.add_type(param_type_name, param_data_type)
